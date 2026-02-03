@@ -14,7 +14,7 @@ website:
 format:
   html:
     toc: true
-    toc-depth: 3
+    toc-depth: 4
     number-sections: true
     embed-resources: false
 editor: visual
@@ -49,6 +49,11 @@ library(gt)
 library(patchwork)
 library(plotly)
 library(DT)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(grid)
 
 
 landing_dir <- file.path("data", "landing")
@@ -72,7 +77,7 @@ landing_data <- setNames(
 This table summarizes the heterogeneous data sources integrated for the exploratory analyses
 
 | Database | Administration level | Temporal unit | Variables |
-|---------------|---------------|---------------|---------------------------|
+|----------------|----------------|----------------|------------------------|
 | DGW_L2 | L2 | Epi week | Dengue cases (by age and sex) |
 | PRCEWL2 | L2 | Epi week | Precipitation (mean, maximum, etc.) |
 | TMPEWL2 | L2 | Epi week | Temperature (mean, maximum, etc.) |
@@ -374,7 +379,6 @@ fig %>%
 
 ```
 
-
 ### Urban Form and Population Metrics (BEC)
 
 The following table reports country level means of selected BEC indicators computed at the SALID2 unit. These descriptive contrasts suggest substantial cross-country heterogeneity in urban form and emissions proxies. For example, PE and AR show higher average street density, while PA and AR present higher per-capita CO2 emissions.
@@ -434,13 +438,11 @@ datatable(
 )
 ```
 
-
 ## Exploratory visualization of dengue seasonality and environmental variability
 
 ### Heatmaps
 
 Bars represent the mean weekly dengue incidence aggregated across years for a given country, while the heatmap summarizes weekly environmental conditions (temperature or precipitation) by year. This combined view facilitates the identification of recurrent seasonal patterns, anomalous years, and potential temporal coincidence between dengue activity and environmental variability. No causal inference is implied.
-
 
 ```{r}
 #| echo: false
@@ -616,12 +618,10 @@ make_period_table <- function(df, iso, value_col, label_value, table_id) {
       sd   = sd(.data[[value_col]], na.rm = TRUE),
       min  = min(.data[[value_col]], na.rm = TRUE),
       max  = max(.data[[value_col]], na.rm = TRUE),
-      n_weeks = sum(!is.na(.data[[value_col]])),
       .groups = "drop"
     ) %>%
     arrange(factor(period, levels = c("2000-2005","2006-2011","2012-2017","2018-2024"))) %>%
-    mutate(metric = label_value) %>%
-    select(metric, period, n_weeks, mean, sd, min, max)
+    select(period, mean, sd, min, max)
 
   if (nrow(tab) == 0) {
     return(tags$p(style="color:#666;", paste0("No data for ", iso, " in defined periods.")))
@@ -769,4 +769,291 @@ js <- tags$script(HTML("
 
 
 browsable(tagList(dropdown, panels, js))
+```
+
+### Maps
+
+![](img/Captura de pantalla 2026-02-03 073554.png)
+
+![](img/Captura de pantalla 2026-02-03 073608.png)
+
+### Scatter plots
+
+These scatter plots visualize the association between weekly climate metrics and dengue incidence at the **SALID1** level, incorporating short time lags.
+
+**Data structure** - Temporal unit: epidemiological week. - Spatial unit: **SALID1** (L1AD). - Each observation corresponds to one SALID1-week.
+
+**Variables** - **X (climate at week Sx):** - Temperature: `TMPEWMEAN_L1` (weekly mean temperature, °C) - Precipitation: `PRCEWMEAN_L1` (weekly mean precipitation, mm) - **Y (dengue outcome):** - `incidence_100k` (weekly dengue incidence per 100,000)
+
+**Lag definition (lead-based)** For each SALID1 time series ordered by `(DGWSYMEPIYR, DGWSYMEPIWK)`, lagged outcomes are built by shifting incidence forward: - Lag0: Climate(Sx) vs Incidence(Sx) - Lag1: Climate(Sx) vs Incidence(Sx+1) - Lag2: Climate(Sx) vs Incidence(Sx+2)
+
+```{r}
+#| echo: true
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(readr)
+library(purrr)
+library(stringr)
+
+# 0) Periodos
+period_def <- function(year) {
+  dplyr::case_when(
+    year >= 2000 & year <= 2005 ~ "2000-2005",
+    year >= 2006 & year <= 2011 ~ "2006-2011",
+    year >= 2012 & year <= 2017 ~ "2012-2017",
+    year >= 2018 & year <= 2024 ~ "2018-2024",
+    TRUE ~ NA_character_
+  )
+}
+
+# 1) Cargar datasets desde landing_data (asegúrate que landing_data ya existe)
+#    Si landing_data no existe aún en tu doc, tienes que ejecutar antes tu bloque que lo crea.
+stopifnot(exists("landing_data"))
+
+# Requiere DGW_L1AD, PRCEWL2, TMPEWL2 en landing_data
+stopifnot("DGW_L1AD" %in% names(landing_data))
+stopifnot("PRCEWL2" %in% names(landing_data))
+stopifnot("TMPEWL2" %in% names(landing_data))
+
+DGWL1AD <- landing_data[["DGW_L1AD"]]
+
+# 2) Cargar PRJ (población L1AD) desde "other data files"
+path_other <- file.path("data", "other data files")
+
+files_prj <- list.files(
+  path = path_other,
+  pattern = "^PRJ.*\\.csv$",
+  full.names = TRUE
+)
+
+stopifnot(length(files_prj) > 0)
+
+PRJ_L1AD_all <- files_prj %>%
+  set_names() %>%
+  map_dfr(~ read_csv(.x, show_col_types = FALSE), .id = "source_file")
+
+# Ajusta nombres si tu PRJ no usa exactamente estas columnas
+stopifnot(all(c("ISO2","SALID1","YEAR","PRJL1ADPOP") %in% names(PRJ_L1AD_all)))
+
+PRJ_L1AD_year <- PRJ_L1AD_all %>%
+  group_by(ISO2, SALID1, YEAR) %>%
+  summarise(PRJL1ADPOP_sum = sum(PRJL1ADPOP, na.rm = TRUE), .groups = "drop") %>%
+  rename(DGWSYMEPIYR = YEAR)
+
+# 3) Dengue semanal a SALID1 (sum casos) + incidencia 100k
+stopifnot(all(c("ISO2","SALID1","DGWSYMEPIYR","DGWSYMEPIWK","DGWCONFIRML1AD") %in% names(DGWL1AD)))
+
+DGWL1AD_sum <- DGWL1AD %>%
+  group_by(ISO2, SALID1, DGWSYMEPIYR, DGWSYMEPIWK) %>%
+  summarise(DGWCONFIRML1AD = sum(DGWCONFIRML1AD, na.rm = TRUE), .groups = "drop")
+
+DGWL1AD_sum_pop <- DGWL1AD_sum %>%
+  left_join(
+    PRJ_L1AD_year %>% select(ISO2, SALID1, DGWSYMEPIYR, PRJL1ADPOP_sum),
+    by = c("ISO2", "SALID1", "DGWSYMEPIYR")
+  )
+
+DGWL1AD_incidence <- DGWL1AD_sum_pop %>%
+  mutate(
+    incidence_100k = dplyr::if_else(
+      is.na(PRJL1ADPOP_sum) | PRJL1ADPOP_sum == 0,
+      NA_real_,
+      (DGWCONFIRML1AD / PRJL1ADPOP_sum) * 1e5
+    )
+  )
+
+# 4) Clima semanal por SALID1
+# Nota: estás promediando desde L2 a SALID1, usando SALID1 en TMP/PRC.
+# Verifica que TMP/PRC realmente tengan SALID1.
+stopifnot(all(c("ISO2","SALID1","EPIYEAR","EPIWEEK") %in% names(TMP)))
+stopifnot(all(c("ISO2","SALID1","EPIYEAR","EPIWEEK") %in% names(PRC)))
+
+TMP_L1_year_w <- TMP %>%
+  group_by(ISO2, SALID1, EPIYEAR, EPIWEEK) %>%
+  summarise(TMPEWMEAN_L1 = mean(TMPEWMEAN_L2, na.rm = TRUE), .groups = "drop")
+
+PRC_L1_year_w <- PRC %>%
+  group_by(ISO2, SALID1, EPIYEAR, EPIWEEK) %>%
+  summarise(PRCEWMEAN_L1 = mean(PRCEWMEANL2, na.rm = TRUE), .groups = "drop")
+
+# 5) Join final
+DGWL1AD_inc_clim <- DGWL1AD_incidence %>%
+  left_join(
+    TMP_L1_year_w %>% select(ISO2, SALID1, EPIYEAR, EPIWEEK, TMPEWMEAN_L1),
+    by = c("ISO2", "SALID1", "DGWSYMEPIYR" = "EPIYEAR", "DGWSYMEPIWK" = "EPIWEEK")
+  ) %>%
+  left_join(
+    PRC_L1_year_w %>% select(ISO2, SALID1, EPIYEAR, EPIWEEK, PRCEWMEAN_L1),
+    by = c("ISO2", "SALID1", "DGWSYMEPIYR" = "EPIYEAR", "DGWSYMEPIWK" = "EPIWEEK")
+  ) %>%
+  mutate(period = period_def(as.integer(DGWSYMEPIYR))) %>%
+  filter(!is.na(period))
+
+```
+
+```{r}
+#| echo: true
+#| warning: false
+#| message: false
+
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+# ----------------------------
+# Settings
+# ----------------------------
+max_lag <- 5
+
+# Optional: downsample to keep render light when plotting ALL SALID1 together
+# Set to NULL to disable sampling.
+max_points_per_plot <- 60000
+
+# ----------------------------
+# Helper: build lagged dataset for a given country and metric
+# Lag definition (as you asked):
+# lag0: X(Sx) vs Inc(Sx)
+# lag1: X(Sx) vs Inc(Sx+1)
+# lag2: X(Sx) vs Inc(Sx+2)
+# ...
+# ----------------------------
+make_scatter_data_lags <- function(dat, iso, metric = c("TMP", "PRC"), max_lag = 5) {
+  metric <- match.arg(metric)
+
+  dfi <- dat %>%
+    filter(ISO2 == iso) %>%
+    transmute(
+      ISO2,
+      SALID1,
+      year   = as.integer(DGWSYMEPIYR),
+      week   = as.integer(DGWSYMEPIWK),
+      period = period,
+      inc    = as.numeric(incidence_100k),
+      x_tmp  = as.numeric(TMPEWMEAN_L1),
+      x_prc  = as.numeric(PRCEWMEAN_L1)
+    ) %>%
+    filter(!is.na(period)) %>%
+    arrange(SALID1, year, week) %>%
+    group_by(SALID1)
+
+  for (k in 0:max_lag) {
+    dfi <- dfi %>% mutate(!!paste0("inc_lag", k) := dplyr::lead(inc, k))
+  }
+
+  dfi <- dfi %>% ungroup()
+
+  xvar <- if (metric == "TMP") "x_tmp" else "x_prc"
+  dfi %>% mutate(x = .data[[xvar]])
+}
+
+# ----------------------------
+# Helper: one scatter plot for a specific lag
+# ----------------------------
+plot_scatter_lag <- function(df, lag_k = 0, metric = c("TMP", "PRC"),
+                             max_points = NULL, iso = NULL) {
+  metric <- match.arg(metric)
+
+  ycol <- paste0("inc_lag", lag_k)
+
+  xlab <- if (metric == "TMP") {
+    "Weekly mean temperature (°C)"
+  } else {
+    "Weekly mean precipitation (mm)"
+  }
+
+  ylab <- paste0("Weekly dengue incidence per 100,000 (Sx+", lag_k, ")")
+
+  # Título como quieres: ISO2 - Temperature - Lag0
+  metric_name <- if (metric == "TMP") "Temperature" else "Precipitation"
+  title_plot <- paste0(iso, " - ", metric_name, " - Lag", lag_k)
+
+  dfp <- df %>%
+    filter(!is.na(x), !is.na(.data[[ycol]]))
+
+  if (!is.null(max_points) && nrow(dfp) > max_points) {
+    set.seed(1)
+    dfp <- dfp %>% slice_sample(n = max_points)
+  }
+
+  ggplot(dfp, aes(x = x, y = .data[[ycol]], color = period)) +
+    geom_point(alpha = 0.5, size = 0.9) +
+    labs(
+      title = title_plot,
+      x = xlab,
+      y = ylab,
+      color = "Period"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.title = element_text(face = "bold"),
+      legend.title = element_text(face = "bold"),
+      plot.title = element_text(face = "bold")
+    )
+}
+
+# ----------------------------
+# Safety checks (fail early with clear messages)
+# ----------------------------
+req_cols <- c(
+  "ISO2", "SALID1", "DGWSYMEPIYR", "DGWSYMEPIWK",
+  "period", "incidence_100k", "TMPEWMEAN_L1", "PRCEWMEAN_L1"
+)
+missing_cols <- setdiff(req_cols, names(DGWL1AD_inc_clim))
+if (length(missing_cols) > 0) {
+  stop("DGWL1AD_inc_clim is missing required columns: ", paste(missing_cols, collapse = ", "))
+}
+
+countries_scatter <- sort(unique(DGWL1AD_inc_clim$ISO2))
+if (length(countries_scatter) == 0) stop("No ISO2 found in DGWL1AD_inc_clim.")
+
+# ----------------------------
+# Render: for each country
+# Temperature lag0..lag5
+# Precipitation lag0..lag5
+# ----------------------------
+for (iso in countries_scatter) {
+
+  cat("\n\n")
+  cat("## Scatter plots - ", iso, "\n\n", sep = "")
+
+  df_tmp <- make_scatter_data_lags(
+    DGWL1AD_inc_clim,
+    iso = iso,
+    metric = "TMP",
+    max_lag = max_lag
+  )
+
+  for (k in 0:max_lag) {
+    print(plot_scatter_lag(
+      df_tmp,
+      lag_k = k,
+      metric = "TMP",
+      max_points = max_points_per_plot,
+      iso = iso
+    ))
+    cat("\n\n")
+  }
+
+  df_prc <- make_scatter_data_lags(
+    DGWL1AD_inc_clim,
+    iso = iso,
+    metric = "PRC",
+    max_lag = max_lag
+  )
+
+  for (k in 0:max_lag) {
+    print(plot_scatter_lag(
+      df_prc,
+      lag_k = k,
+      metric = "PRC",
+      max_points = max_points_per_plot,
+      iso = iso
+    ))
+    cat("\n\n")
+  }
+}
+
 ```
