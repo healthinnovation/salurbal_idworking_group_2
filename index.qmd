@@ -1,0 +1,772 @@
+---
+title: "ID Working Group – SALURBAL Climate"
+author:
+  - name: "Edson Ascencio"
+  - name: "Yomali Ferreyra"
+  - name: "Gabriel Carrasco"
+date: "January 20, 2026"
+project:
+  type: website
+  output-dir: _site
+website:
+  title: "ID Working Group – SALURBAL Climate"
+  navbar: false
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    embed-resources: false
+editor: visual
+---
+
+```{r}
+#| include: false
+options(
+  warn = 1,
+  dplyr.summarise.inform = FALSE,
+  htmltools.dir.version = FALSE
+)
+```
+
+## Summary
+
+This report presents an initial exploration of dengue surveillance data in relation to temperature and other environmental and contextual variables, with the aim of characterizing data quality, temporal dynamics, and plausible associations prior to formal analytical modeling.
+
+## Data preparation
+
+Cleaned datasets stored in RDS format were programmatically identified, imported, and consolidated into a unified in-memory structure to ensure reproducibility, scalability, and consistency across data sources.
+
+```{r}
+#| warning: false
+#| echo: true
+#| code-fold: true
+library(tidyverse)
+library(stringr)
+library(readr)
+library(purrr)
+library(gt)
+library(patchwork)
+library(plotly)
+library(DT)
+
+
+landing_dir <- file.path("data", "landing")
+rds_files <- list.files(
+  landing_dir,
+  pattern = "\\.rds$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+landing_data <- setNames(
+  map(rds_files, readRDS),
+  basename(rds_files) |> sub("\\.rds$", "", x = _)
+)
+```
+
+## Data availability
+
+### Datasets
+
+This table summarizes the heterogeneous data sources integrated for the exploratory analyses
+
+| Database | Administration level | Temporal unit | Variables |
+|---------------|---------------|---------------|---------------------------|
+| DGW_L2 | L2 | Epi week | Dengue cases (by age and sex) |
+| PRCEWL2 | L2 | Epi week | Precipitation (mean, maximum, etc.) |
+| TMPEWL2 | L2 | Epi week | Temperature (mean, maximum, etc.) |
+| BEC_L2 | L2 | Years | Urban and population metrics |
+| PRJ | L1AD | Years | Projected population |
+| SECGDPGPC | L1AD | Years | GDP per capita (PPP, constant 2011 international USD) |
+| IADB_Indicators_L2 | L2 | Years | Socioeconomic development indicators |
+| SEC_Census_L2 | L2 | Years | Household and labor force indicators |
+| SEC_GINI_L2 | L2 | Years | GINI index |
+
+### Dengue cases
+
+**Dengue case datasets** are available for several countries, including **Brazil (BR), Colombia (CO), Argentina (AR), Peru (PE), Panama (PA), Guatemala (GT), and Mexico (MX)**. Among these, BR, CO, PA, and PE present more than 10 consecutive years of dengue surveillance data
+
+Years marked with an asterisk (\*) indicate the availability of both temperature and precipitation data at the L2 spatial level, defining the temporal window where joint dengue--climate analyses are feasible.
+
+```{r}
+#| echo: true
+#| warning: false
+#| message: false
+#| code-fold: true
+#| code-summary: "Show code"
+#| out-width: "100%"
+#| fig-align: "center"
+
+DGW <- landing_data[["DGW_L2"]]
+PRC <- landing_data[["PRCEWL2"]]
+TMP <- landing_data[["TMPEWL2"]]
+
+CONF_COL     <- "DGWCONFIRML2"          
+CONF_SUS_COL <- "DGWCONFPROBL2"   
+
+countries_env <- union(unique(PRC$ISO2), unique(TMP$ISO2))
+
+prc_rng <- PRC %>%
+  group_by(ISO2) %>%
+  summarise(prc_min = min(EPIYEAR, na.rm = TRUE),
+            prc_max = max(EPIYEAR, na.rm = TRUE), .groups = "drop")
+
+tmp_rng <- TMP %>%
+  group_by(ISO2) %>%
+  summarise(tmp_min = min(EPIYEAR, na.rm = TRUE),
+            tmp_max = max(EPIYEAR, na.rm = TRUE), .groups = "drop")
+
+env_rng <- full_join(prc_rng, tmp_rng, by = "ISO2") %>%
+  mutate(
+    env_min = pmax(prc_min, tmp_min, na.rm = TRUE),
+    env_max = pmin(prc_max, tmp_max, na.rm = TRUE),
+    has_both = !is.na(prc_min) & !is.na(tmp_min)
+  )
+
+dengue_year <- DGW %>%
+  filter(ISO2 %in% countries_env) %>%
+  group_by(ISO2, year = DGWSYMEPIYR) %>%
+  summarise(
+    confirmed = sum(.data[[CONF_COL]], na.rm = TRUE),
+    conf_plus_presum = sum(.data[[CONF_SUS_COL]], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+years_all <- sort(unique(dengue_year$year))
+grid <- expand_grid(
+  ISO2 = sort(unique(countries_env)),
+  year = years_all
+) %>%
+  left_join(env_rng %>% select(ISO2, env_min, env_max, has_both), by = "ISO2") %>%
+  mutate(
+    star = ifelse(has_both & year >= env_min & year <= env_max, "*", "")
+  )
+
+plot_df <- grid %>%
+  left_join(dengue_year, by = c("ISO2", "year")) %>%
+  mutate(
+    confirmed = replace_na(confirmed, 0),
+    conf_plus_presum = replace_na(conf_plus_presum, 0),
+    case_type = case_when(
+      conf_plus_presum > 0 ~ "Confirmed + presumptive",
+      confirmed > 0        ~ "Confirmed only",
+      TRUE                 ~ "No cases"
+    ),
+    case_type = factor(case_type, levels = c("No cases", "Confirmed only", "Confirmed + presumptive"))
+  )
+
+p<-ggplot(plot_df, aes(x = year, y = ISO2, fill = case_type)) +
+  geom_tile(color = "white", linewidth = 0.2) +
+  geom_text(
+    aes(label = star, color = case_type),
+    size = 5,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "No cases" = "white",
+      "Confirmed only" = "#2F4F4F",
+      "Confirmed + presumptive" = "#003B73"
+    ),
+    breaks = c("Confirmed only", "Confirmed + presumptive")
+  ) +
+  scale_color_manual(
+    values = c(
+      "No cases" = "grey60",
+      "Confirmed only" = "white",
+      "Confirmed + presumptive" = "white"
+    ),
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    limits = c(1999, 2025),
+    breaks = 2000:2024,
+    expand = c(0, 0)
+  ) +
+  labs(x = "", y = "", fill = "") +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    legend.position = "top",
+    legend.direction = "horizontal"
+  ) +
+  guides(
+    fill = guide_legend(
+      nrow = 1,
+      byrow = TRUE
+    )
+  )
+
+ggplotly(p)
+```
+
+Next figure shows the proportional distribution of dengue case records by country across four time periods (2000–2005, 2006–2011, 2012–2017, and 2018–2024). Marked heterogeneity in temporal coverage is evident across countries. **BR, CO, GT, and PE** display dengue data spanning multiple periods, whereas **AR and MX** concentrate their records in more recent years.
+
+```{r}
+#| echo: true
+#| warning: false
+#| message: false
+#| code-fold: true
+#| code-summary: "Show code"
+#| out-width: "100%"
+#| fig-align: "center"
+
+dengue_year2 <- dengue_year %>%
+  mutate(
+    period = case_when(
+      year >= 2000 & year <= 2005 ~ "2000-2005",
+      year >= 2006 & year <= 2011 ~ "2006-2011",
+      year >= 2012 & year <= 2017 ~ "2012-2017",
+      year >= 2018 & year <= 2024 ~ "2018-2024",
+      TRUE ~ NA_character_
+    )
+  )
+
+dengue_period_pct <- dengue_year2 %>%
+  group_by(ISO2, period) %>%
+  summarise(cases = sum(confirmed, na.rm = TRUE), .groups = "drop") %>%
+  group_by(ISO2) %>%
+  mutate(pct = cases / sum(cases) * 100) %>%
+  ungroup() %>%
+  mutate(period = factor(period, levels = c("2000-2005","2006-2011","2012-2017","2018-2024")))
+
+blue_palette <- c(
+  "2000-2005" = "#001B3A",
+  "2006-2011" = "#003B73",
+  "2012-2017" = "#4C78A8",
+  "2018-2024" = "#9ECAE1"
+)
+
+p2 <- ggplot(dengue_period_pct, aes(x = ISO2, y = pct, fill = period,
+                                    text = paste0("ISO2: ", ISO2,
+                                                  "<br>Period: ", period,
+                                                  "<br>%: ", round(pct,1),
+                                                  "<br>Cases: ", scales::comma(cases)))) +
+  geom_col(width = 0.85, color = "white", linewidth = 0.2) +
+  scale_fill_manual(values = blue_palette) +
+  scale_y_continuous(labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+  labs(x = "", y = "", fill = "") +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    legend.direction = "horizontal"
+  )
+
+ggplotly(p2, tooltip = "text")
+```
+
+This interactive bar chart enables users to compare **aggregated dengue case counts** across **countries** for **selected years**. Users may select **one or multiple years**, and the visualization displays the **total number of confirmed dengue cases** summed across the selected period for each country.
+
+```{r}
+#| echo: true
+#| warning: false
+#| message: false
+#| code-fold: true
+
+dgw_country_year <- DGW %>%
+  transmute(
+    ISO2 = ISO2,
+    year = as.integer(DGWSYMEPIYR),
+    cases = .data[[CONF_COL]]
+  ) %>%
+  filter(!is.na(ISO2), !is.na(year)) %>%
+  group_by(ISO2, year) %>%
+  summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop")
+
+years_available <- sort(unique(dgw_country_year$year))
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| out-width: "100%"
+
+make_bar_year <- function(yy, log_scale = TRUE) {
+  df <- dgw_country_year %>%
+    filter(year == yy) %>%
+    group_by(ISO2) %>%
+    summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop") %>%
+    arrange(desc(cases)) %>%
+    mutate(
+      cases_plot = if (isTRUE(log_scale)) log1p(cases) else cases
+    )
+
+  df
+}
+
+years <- years_available
+
+# Precompute traces (one per year) using log scale by default
+traces <- lapply(years, function(yy) {
+  df <- make_bar_year(yy, log_scale = TRUE)
+  list(
+    x = df$ISO2,
+    y = df$cases_plot,
+    text = scales::comma(df$cases),
+    customdata = df$cases,
+    type = "bar",
+    visible = FALSE
+  )
+})
+
+# Show last year by default
+traces[[length(traces)]]$visible <- TRUE
+
+fig <- plot_ly()
+for (tr in traces) {
+  fig <- fig %>% add_trace(
+    x = tr$x, y = tr$y, type = tr$type,
+    text = tr$text, hovertemplate = "ISO2=%{x}<br>Cases=%{customdata:,}<extra></extra>",
+    customdata = tr$customdata,
+    visible = tr$visible
+  )
+}
+
+# Dropdown to switch year
+buttons_year <- lapply(seq_along(years), function(i) {
+  vis <- rep(FALSE, length(years)); vis[i] <- TRUE
+  list(
+    method = "update",
+    args = list(
+      list(visible = vis),
+      list(title = paste0("Total confirmed dengue cases by country (", years[i], ")"),
+           yaxis = list(title = "log1p(total dengue cases)"))
+    ),
+    label = as.character(years[i])
+  )
+})
+
+# Toggle log vs raw by updating y values for all traces
+# We rebuild y arrays for both modes
+y_log <- lapply(years, function(yy) make_bar_year(yy, TRUE)$cases_plot)
+y_raw <- lapply(years, function(yy) make_bar_year(yy, FALSE)$cases_plot)
+
+buttons_scale <- list(
+  list(
+    method = "restyle",
+    args = list("y", y_log),
+    label = "Log scale (log1p)"
+  ),
+  list(
+    method = "restyle",
+    args = list("y", y_raw),
+    label = "Raw cases"
+  )
+)
+
+fig %>%
+  layout(
+    title = paste0("Total confirmed dengue cases by country (", years[length(years)], ")"),
+    xaxis = list(title = ""),
+    yaxis = list(title = "log1p(total dengue cases)"),
+    updatemenus = list(
+      list(type = "dropdown", buttons = buttons_year, x = 0.0, y = 1.15),
+      list(type = "buttons",  buttons = buttons_scale, direction = "right", x = 0.55, y = 1.15)
+    ),
+    margin = list(t = 90)
+  )
+
+
+```
+
+
+### Urban Form and Population Metrics (BEC)
+
+The following table reports country level means of selected BEC indicators computed at the SALID2 unit. These descriptive contrasts suggest substantial cross-country heterogeneity in urban form and emissions proxies. For example, PE and AR show higher average street density, while PA and AR present higher per-capita CO2 emissions.
+
+```{r}
+#| echo: true
+#| warning: false
+#| message: false
+#| code-fold: true
+#| out-width: "100%"
+
+BEC_dataset <- read_csv("data/other data files/BEC_L2_08162023.csv", show_col_types = FALSE)
+id_cols <- c("ISO2", "SALID0", "SALID1", "SALID2")
+
+BEC_long <- BEC_dataset %>%
+  pivot_longer(
+    cols = -all_of(id_cols),
+    names_to = "full_name",
+    values_to = "value"
+  )
+
+vars_keep <- c(
+  "BECNBHDCENTL2",
+  "BECTUAREAL2",
+  "BECPCTURBANL2",
+  "BECTGSAREAL2",
+  "BECADSTTDENSL2",
+  "BECTOTCO2L2",
+  "BECPERCAPCO2L2"
+)
+
+var_labels <- c(
+  BECNBHDCENTL2   = "Distance to neighborhood center",
+  BECTUAREAL2    = "Total urban area",
+  BECPCTURBANL2  = "Percent urban area",
+  BECTGSAREAL2   = "Total green space area",
+  BECADSTTDENSL2 = "Street density",
+  BECTOTCO2L2    = "Total CO2 emissions",
+  BECPERCAPCO2L2 = "Per capita CO2 emissions"
+)
+
+bec_country_mean <- BEC_long %>%
+  filter(full_name %in% vars_keep) %>%
+  group_by(ISO2, full_name) %>%
+  summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(variable_label = var_labels[full_name]) %>%
+  select(ISO2, variable_label, mean_value)
+
+bec_country_wide <- bec_country_mean %>%
+  pivot_wider(names_from = variable_label, values_from = mean_value) %>%
+  arrange(ISO2)
+
+datatable(
+  bec_country_wide,
+  rownames = FALSE,
+  options = list(pageLength = 10, scrollX = TRUE)
+)
+```
+
+
+## Exploratory visualization of dengue seasonality and environmental variability
+
+### Heatmaps
+
+Bars represent the mean weekly dengue incidence aggregated across years for a given country, while the heatmap summarizes weekly environmental conditions (temperature or precipitation) by year. This combined view facilitates the identification of recurrent seasonal patterns, anomalous years, and potential temporal coincidence between dengue activity and environmental variability. No causal inference is implied.
+
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+library(htmltools)
+library(plotly)
+library(DT)
+library(tidyverse)
+
+CONF_COL <- "DGWCONFIRML2"
+
+period_def <- function(year) {
+  dplyr::case_when(
+    year >= 2000 & year <= 2005 ~ "2000-2005",
+    year >= 2006 & year <= 2011 ~ "2006-2011",
+    year >= 2012 & year <= 2017 ~ "2012-2017",
+    year >= 2018 & year <= 2024 ~ "2018-2024",
+    TRUE ~ NA_character_
+  )
+}
+
+# 1) Dengue weekly aggregates (barras)
+DGW_yearweek_sum <- DGW %>%
+  transmute(
+    ISO2,
+    EPIYEAR = as.integer(DGWSYMEPIYR),
+    EPIWEEK = as.integer(DGWSYMEPIWK),
+    confirmed = as.numeric(.data[[CONF_COL]])
+  ) %>%
+  filter(!is.na(ISO2), !is.na(EPIYEAR), !is.na(EPIWEEK), EPIWEEK >= 1, EPIWEEK <= 53) %>%
+  group_by(ISO2, EPIYEAR, EPIWEEK) %>%
+  summarise(confirmed_sum = sum(confirmed, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::complete(ISO2, EPIYEAR, EPIWEEK = 1:53, fill = list(confirmed_sum = 0))
+
+DGW_week_mean <- DGW_yearweek_sum %>%
+  group_by(ISO2, EPIWEEK) %>%
+  summarise(confirmed_week_mean = mean(confirmed_sum, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::complete(ISO2, EPIWEEK = 1:53, fill = list(confirmed_week_mean = 0))
+
+# 2) Climate weekly aggregates (heatmaps)
+TMP_agg <- TMP %>%
+  transmute(
+    ISO2,
+    EPIYEAR = as.integer(EPIYEAR),
+    EPIWEEK = as.integer(EPIWEEK),
+    TMP_mean = as.numeric(TMPEWMEAN_L2)
+  ) %>%
+  filter(!is.na(ISO2), !is.na(EPIYEAR), !is.na(EPIWEEK), EPIWEEK >= 1, EPIWEEK <= 53) %>%
+  group_by(ISO2, EPIYEAR, EPIWEEK) %>%
+  summarise(TMP_mean = mean(TMP_mean, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::complete(ISO2, EPIYEAR, EPIWEEK = 1:53)
+
+PRC_agg <- PRC %>%
+  transmute(
+    ISO2,
+    EPIYEAR = as.integer(EPIYEAR),
+    EPIWEEK = as.integer(EPIWEEK),
+    PRC_mean = as.numeric(PRCEWMEANL2)
+  ) %>%
+  filter(!is.na(ISO2), !is.na(EPIYEAR), !is.na(EPIWEEK), EPIWEEK >= 1, EPIWEEK <= 53) %>%
+  group_by(ISO2, EPIYEAR, EPIWEEK) %>%
+  summarise(PRC_mean = mean(PRC_mean, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::complete(ISO2, EPIYEAR, EPIWEEK = 1:53)
+
+# 3) Countries overlap
+countries <- sort(intersect(
+  unique(DGW_week_mean$ISO2),
+  union(unique(TMP_agg$ISO2), unique(PRC_agg$ISO2))
+))
+stopifnot(length(countries) > 0)
+
+# 4) Paletas (mantener “blue” y “warm” como pediste)
+# Plotly colorscale: list(list(pos, color), ...)
+colorscale_warm <- list(
+  list(0.0, "#2c7fb8"),
+  list(0.5, "#ffffbf"),
+  list(1.0, "#d73027")
+)
+
+colorscale_blue <- list(
+  list(0.0, "#deebf7"),
+  list(1.0, "#08519c")
+)
+
+# 5) Heatmap plotly con leyenda abajo
+make_heatmap_plotly <- function(df, iso, value_col, title_prefix, zlab, colorscale_use) {
+
+  dfi <- df %>%
+    filter(ISO2 == iso) %>%
+    mutate(EPIYEAR = as.integer(EPIYEAR), EPIWEEK = as.integer(EPIWEEK)) %>%
+    filter(EPIWEEK >= 1, EPIWEEK <= 53)
+
+  yrs <- sort(unique(dfi$EPIYEAR))
+  wks <- 1:53
+
+  mat <- dfi %>%
+    select(EPIYEAR, EPIWEEK, val = all_of(value_col)) %>%
+    complete(EPIYEAR = yrs, EPIWEEK = wks) %>%
+    arrange(EPIYEAR, EPIWEEK) %>%
+    pivot_wider(names_from = EPIWEEK, values_from = val) %>%
+    select(-EPIYEAR) %>%
+    as.matrix()
+
+  plot_ly(
+    x = wks, y = yrs, z = mat,
+    type = "heatmap",
+    colorscale = colorscale_use,
+    colorbar = list(
+      orientation = "h",
+      x = 0.5, xanchor = "center",
+      y = -0.25,
+      thickness = 12
+    ),
+    hovertemplate = paste0(
+      "ISO2: ", iso,
+      "<br>Year: %{y}",
+      "<br>Week: %{x}",
+      "<br>", zlab, ": %{z:.2f}",
+      "<extra></extra>"
+    )
+  ) %>%
+    layout(
+      title = paste0(title_prefix, " - ", iso),
+      xaxis = list(title = "Epi week", range = c(1, 53)),
+      yaxis = list(title = "Year")
+    )
+}
+
+# 6) Barras plotly (escala LINEAL)
+make_bars_plotly <- function(iso) {
+  wks <- 1:53  # <- FIX: define aquí para que NO dependa de nada externo
+
+  df <- DGW_week_mean %>%
+    filter(ISO2 == iso) %>%
+    arrange(EPIWEEK) %>%
+    mutate(
+      EPIWEEK = as.integer(EPIWEEK),
+      confirmed_week_mean = as.numeric(confirmed_week_mean)
+    ) %>%
+    tidyr::complete(EPIWEEK = wks, fill = list(confirmed_week_mean = 0))
+
+  plot_ly(
+    data = df,
+    x = ~EPIWEEK,
+    y = ~confirmed_week_mean,
+    type = "bar",
+    hovertemplate = paste0(
+      "ISO2: ", iso,
+      "<br>Week: %{x}",
+      "<br>Mean cases: %{y:.2f}",
+      "<extra></extra>"
+    )
+  ) %>%
+    layout(
+      title = paste0("Mean weekly dengue - ", iso),
+      xaxis = list(title = "Epi week", range = c(1, 53)),
+      yaxis = list(title = "Mean weekly cases")
+    )
+}
+
+# 7) Tabla resumen por periodos (DT)
+make_period_table <- function(df, iso, value_col, label_value, table_id) {
+
+  tab <- df %>%
+    filter(ISO2 == iso) %>%
+    mutate(period = period_def(EPIYEAR)) %>%
+    filter(!is.na(period)) %>%
+    group_by(period) %>%
+    summarise(
+      mean = mean(.data[[value_col]], na.rm = TRUE),
+      sd   = sd(.data[[value_col]], na.rm = TRUE),
+      min  = min(.data[[value_col]], na.rm = TRUE),
+      max  = max(.data[[value_col]], na.rm = TRUE),
+      n_weeks = sum(!is.na(.data[[value_col]])),
+      .groups = "drop"
+    ) %>%
+    arrange(factor(period, levels = c("2000-2005","2006-2011","2012-2017","2018-2024"))) %>%
+    mutate(metric = label_value) %>%
+    select(metric, period, n_weeks, mean, sd, min, max)
+
+  if (nrow(tab) == 0) {
+    return(tags$p(style="color:#666;", paste0("No data for ", iso, " in defined periods.")))
+  }
+
+  DT::datatable(
+    tab,
+    rownames = FALSE,
+    elementId = table_id,
+    options = list(
+      pageLength = 10,
+      scrollX = TRUE,
+      autoWidth = TRUE
+    ),
+    caption = htmltools::tags$caption(
+      style = "caption-side: top; text-align: left; font-weight: 600;",
+      paste0("Summary by period - ", iso)
+    )
+  ) %>% DT::formatRound(columns = c("mean","sd","min","max"), digits = 2)
+}
+
+# 8) Pre-render widgets por país
+widgets_by_iso <- lapply(countries, function(iso) {
+  list(
+    bars = make_bars_plotly(iso),
+
+    tmp_hm  = make_heatmap_plotly(TMP_agg, iso, "TMP_mean",
+                                  "Temperature heatmap", "Temp (C)",
+                                  colorscale_use = colorscale_warm),
+    tmp_tab = make_period_table(TMP_agg, iso, "TMP_mean",
+                                "Temperature (weekly mean)",
+                                table_id = paste0("dt_tmp_", iso)),
+
+    prc_hm  = make_heatmap_plotly(PRC_agg, iso, "PRC_mean",
+                                  "Precipitation heatmap", "Prc (mm)",
+                                  colorscale_use = colorscale_blue),
+    prc_tab = make_period_table(PRC_agg, iso, "PRC_mean",
+                                "Precipitation (weekly mean)",
+                                table_id = paste0("dt_prc_", iso))
+  )
+})
+names(widgets_by_iso) <- countries
+
+```
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+
+iso0 <- countries[1]
+
+dropdown <- tags$div(
+  tags$label(`for` = "iso_select", tags$b("Select country (ISO2):")),
+  tags$select(
+    id = "iso_select",
+    style = "margin-left:8px; padding:4px 6px;",
+    lapply(countries, function(iso) {
+      tags$option(value = iso, if (iso == iso0) "selected" else NULL, iso)
+    })
+  ),
+  tags$hr(style = "margin: 12px 0;")
+)
+
+panels <- tagList(
+  lapply(countries, function(iso) {
+    is_default <- iso == iso0
+
+    tags$div(
+      class = "iso-panel",
+      id = paste0("panel_", iso),
+      style = if (is_default) {
+        "display:block; position:static; left:auto; top:auto; width:100%;"
+      } else {
+        "display:block; position:absolute; left:-10000px; top:0; width:100%;"
+      },
+
+      tags$h4("Bars"),
+      widgets_by_iso[[iso]]$bars,
+
+      tags$h4("Temperature"),
+      widgets_by_iso[[iso]]$tmp_hm,
+      widgets_by_iso[[iso]]$tmp_tab,
+
+      tags$h4("Precipitation"),
+      widgets_by_iso[[iso]]$prc_hm,
+      widgets_by_iso[[iso]]$prc_tab
+    )
+  })
+)
+
+js <- tags$script(HTML("
+(function(){
+  function hideAll(){
+    var panels = document.querySelectorAll('.iso-panel');
+    panels.forEach(function(p){
+      p.style.display = 'block';
+      p.style.position = 'absolute';
+      p.style.left = '-10000px';
+      p.style.top = '0px';
+      p.style.width = '100%';
+    });
+  }
+
+  function showPanel(iso){
+    hideAll();
+
+    var el = document.getElementById('panel_' + iso);
+    if(!el) return;
+
+    el.style.display = 'block';
+    el.style.position = 'static';
+    el.style.left = 'auto';
+    el.style.top = 'auto';
+    el.style.width = '100%';
+
+    // Plotly resize
+    if(window.Plotly){
+      var plots = el.querySelectorAll('.plotly.html-widget');
+      plots.forEach(function(node){
+        try { Plotly.Plots.resize(node); } catch(e) {}
+      });
+    }
+
+    // DataTables adjust
+    setTimeout(function(){
+      if(window.jQuery && jQuery.fn && jQuery.fn.dataTable){
+        jQuery(el).find('table.dataTable').each(function(){
+          try {
+            var dt = jQuery(this).DataTable();
+            dt.columns.adjust();
+            dt.draw(false);
+          } catch(e) {}
+        });
+      }
+    }, 150);
+  }
+
+  var sel = document.getElementById('iso_select');
+  if(sel){
+    sel.addEventListener('change', function(){ showPanel(this.value); });
+  }
+})();
+"))
+
+
+browsable(tagList(dropdown, panels, js))
+```
