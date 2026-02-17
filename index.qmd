@@ -54,7 +54,9 @@ library(dplyr)
 library(ggplot2)
 library(cowplot)
 library(grid)
-
+library(crosstalk)
+library(scales)
+library(ISOweek)
 
 landing_dir <- file.path("data", "landing")
 rds_files <- list.files(
@@ -77,7 +79,7 @@ landing_data <- setNames(
 This table summarizes the heterogeneous data sources integrated for the exploratory analyses
 
 | Database | Administration level | Temporal unit | Variables |
-|----------------|----------------|----------------|------------------------|
+|-----------------|-----------------|-----------------|---------------------|
 | DGW_L2 | L2 | Epi week | Dengue cases (by age and sex) |
 | PRCEWL2 | L2 | Epi week | Precipitation (mean, maximum, etc.) |
 | TMPEWL2 | L2 | Epi week | Temperature (mean, maximum, etc.) |
@@ -161,21 +163,25 @@ plot_df <- grid %>%
     case_type = factor(case_type, levels = c("No cases", "Confirmed only", "Confirmed + presumptive"))
   )
 
-p<-ggplot(plot_df, aes(x = year, y = ISO2, fill = case_type)) +
+p <- ggplot(plot_df, aes(x = year, y = ISO2, fill = case_type)) +
   geom_tile(color = "white", linewidth = 0.2) +
   geom_text(
     aes(label = star, color = case_type),
     size = 5,
     fontface = "bold"
   ) +
+  geom_vline(xintercept = 2013.5, color = "red", linewidth = 0.8) +
+
   scale_fill_manual(
     values = c(
       "No cases" = "white",
       "Confirmed only" = "#2F4F4F",
       "Confirmed + presumptive" = "#003B73"
     ),
-    breaks = c("Confirmed only", "Confirmed + presumptive")
+    breaks = c("Confirmed only", "Confirmed + presumptive"),
+    guide = guide_legend(override.aes = list(alpha = 1))
   ) +
+
   scale_color_manual(
     values = c(
       "No cases" = "grey60",
@@ -184,12 +190,15 @@ p<-ggplot(plot_df, aes(x = year, y = ISO2, fill = case_type)) +
     ),
     guide = "none"
   ) +
+
   scale_x_continuous(
     limits = c(1999, 2025),
     breaks = 2000:2024,
     expand = c(0, 0)
   ) +
+
   labs(x = "", y = "", fill = "") +
+
   theme_minimal(base_size = 11) +
   theme(
     panel.grid = element_blank(),
@@ -197,11 +206,9 @@ p<-ggplot(plot_df, aes(x = year, y = ISO2, fill = case_type)) +
     legend.position = "top",
     legend.direction = "horizontal"
   ) +
+
   guides(
-    fill = guide_legend(
-      nrow = 1,
-      byrow = TRUE
-    )
+    fill = guide_legend(nrow = 1, byrow = TRUE)
   )
 
 ggplotly(p)
@@ -264,7 +271,9 @@ p2 <- ggplot(dengue_period_pct, aes(x = ISO2, y = pct, fill = period,
 ggplotly(p2, tooltip = "text")
 ```
 
-This interactive bar chart enables users to compare **aggregated dengue case counts** across **countries** for **selected years**. Users may select **one or multiple years**, and the visualization displays the **total number of confirmed dengue cases** summed across the selected period for each country.
+This interactive **line chart** displays the **total number of confirmed dengue cases per country** across **all available years**. Each line represents a country.
+
+Because case counts may vary substantially between countries, the chart includes an optional **scaling control** that adjusts the **y-axis**
 
 ```{r}
 #| echo: true
@@ -272,6 +281,7 @@ This interactive bar chart enables users to compare **aggregated dengue case cou
 #| message: false
 #| code-fold: true
 
+# Country-year
 dgw_country_year <- DGW %>%
   transmute(
     ISO2 = ISO2,
@@ -282,7 +292,19 @@ dgw_country_year <- DGW %>%
   group_by(ISO2, year) %>%
   summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop")
 
-years_available <- sort(unique(dgw_country_year$year))
+# SALID1-year
+stopifnot("SALID1" %in% names(DGW))
+
+dgw_salid1_year <- DGW %>%
+  transmute(
+    ISO2 = ISO2,
+    SALID1 = SALID1,
+    year = as.integer(DGWSYMEPIYR),
+    cases = .data[[CONF_COL]]
+  ) %>%
+  filter(!is.na(ISO2), !is.na(SALID1), !is.na(year)) %>%
+  group_by(ISO2, SALID1, year) %>%
+  summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop")
 ```
 
 ```{r}
@@ -291,92 +313,284 @@ years_available <- sort(unique(dgw_country_year$year))
 #| message: false
 #| out-width: "100%"
 
-make_bar_year <- function(yy, log_scale = TRUE) {
-  df <- dgw_country_year %>%
-    filter(year == yy) %>%
-    group_by(ISO2) %>%
-    summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop") %>%
-    arrange(desc(cases)) %>%
-    mutate(
-      cases_plot = if (isTRUE(log_scale)) log1p(cases) else cases
-    )
+TOP_N <- 20
 
-  df
-}
+df_overview <- dgw_country_year %>%
+  group_by(ISO2) %>%
+  mutate(total = sum(cases, na.rm = TRUE)) %>%
+  ungroup() %>%
+  arrange(desc(total)) %>%
+  filter(ISO2 %in% unique(ISO2)[1:TOP_N]) %>%  # alternativa rápida, abajo va mejor
+  select(-total)
 
-years <- years_available
+# Mejor selección Top N
+top_countries <- dgw_country_year %>%
+  group_by(ISO2) %>%
+  summarise(total = sum(cases, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  slice_head(n = TOP_N) %>%
+  pull(ISO2)
 
-# Precompute traces (one per year) using log scale by default
-traces <- lapply(years, function(yy) {
-  df <- make_bar_year(yy, log_scale = TRUE)
-  list(
-    x = df$ISO2,
-    y = df$cases_plot,
-    text = scales::comma(df$cases),
-    customdata = df$cases,
-    type = "bar",
-    visible = FALSE
+df_overview <- dgw_country_year %>%
+  filter(ISO2 %in% top_countries) %>%
+  mutate(cases_sqrt = sqrt(pmax(cases, 0)))
+
+p1 <- ggplot(
+  df_overview,
+  aes(
+    x = year, y = cases,
+    color = ISO2, group = ISO2,
+    text = paste0("ISO2: ", ISO2, "<br>Year: ", year, "<br>Cases: ", scales::comma(cases))
   )
-})
-
-# Show last year by default
-traces[[length(traces)]]$visible <- TRUE
-
-fig <- plot_ly()
-for (tr in traces) {
-  fig <- fig %>% add_trace(
-    x = tr$x, y = tr$y, type = tr$type,
-    text = tr$text, hovertemplate = "ISO2=%{x}<br>Cases=%{customdata:,}<extra></extra>",
-    customdata = tr$customdata,
-    visible = tr$visible
+) +
+  geom_line(alpha = 0.8, linewidth = 0.7) +
+  theme_minimal() +
+  labs(
+    title = NULL,
+    x = "Year", y = "Cases", color = "ISO2"
   )
-}
 
-# Dropdown to switch year
-buttons_year <- lapply(seq_along(years), function(i) {
-  vis <- rep(FALSE, length(years)); vis[i] <- TRUE
-  list(
-    method = "update",
-    args = list(
-      list(visible = vis),
-      list(title = paste0("Total confirmed dengue cases by country (", years[i], ")"),
-           yaxis = list(title = "log1p(total dengue cases)"))
-    ),
-    label = as.character(years[i])
-  )
-})
+g1 <- ggplotly(p1, tooltip = "text")
 
-# Toggle log vs raw by updating y values for all traces
-# We rebuild y arrays for both modes
-y_log <- lapply(years, function(yy) make_bar_year(yy, TRUE)$cases_plot)
-y_raw <- lapply(years, function(yy) make_bar_year(yy, FALSE)$cases_plot)
+# Build y arrays for toggling
+y_raw <- split(df_overview$cases, df_overview$ISO2)
+y_sqrt <- split(df_overview$cases_sqrt, df_overview$ISO2)
+trace_order <- sapply(g1$x$data, function(tr) tr$name)
 
-buttons_scale <- list(
-  list(
-    method = "restyle",
-    args = list("y", y_log),
-    label = "Log scale (log1p)"
-  ),
-  list(
-    method = "restyle",
-    args = list("y", y_raw),
-    label = "Raw cases"
-  )
-)
+y_raw_list  <- unname(lapply(trace_order, function(nm) y_raw[[nm]]))
+y_sqrt_list <- unname(lapply(trace_order, function(nm) y_sqrt[[nm]]))
 
-fig %>%
+g1 %>%
   layout(
-    title = paste0("Total confirmed dengue cases by country (", years[length(years)], ")"),
-    xaxis = list(title = ""),
-    yaxis = list(title = "log1p(total dengue cases)"),
+    yaxis = list(title = "Cases"),
+    legend = list(itemclick = "toggleothers", itemdoubleclick = "toggle"),
     updatemenus = list(
-      list(type = "dropdown", buttons = buttons_year, x = 0.0, y = 1.15),
-      list(type = "buttons",  buttons = buttons_scale, direction = "right", x = 0.55, y = 1.15)
+      list(
+        type = "buttons",
+        direction = "right",
+        x = 0.45, y = 1.15,
+        buttons = list(
+          list(
+            method = "update",
+            args = list(
+              list(y = y_raw_list),
+              list(yaxis = list(title = "Cases"),
+                   title = NULL)
+            ),
+            label = "Raw"
+          ),
+          list(
+            method = "update",
+            args = list(
+              list(y = y_sqrt_list),
+              list(yaxis = list(title = "sqrt(Cases)"),
+                   title = NULL)
+            ),
+            label = "Sqrt scale"
+          )
+        )
+      )
     ),
     margin = list(t = 90)
   )
 
 
+```
+
+The following interactive line chart displays annual confirmed dengue cases across the **top 15 SALID1** urban areas for each selected country. Labels correspond to city names (L1NAME) Users can **switch countries** via a dropdown menu and toggle between linear and square-root scaling to better visualize differences in magnitude across cities.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| out-width: "100%"
+
+wrap_words_br <- function(x, n = 3) {
+  if (is.na(x) || !nzchar(x)) return(x)
+  words <- unlist(str_split(x, "\\s+"))
+  if (length(words) <= n) return(x)
+
+  idx <- seq(n + 1, length(words), by = n)
+  words[idx] <- paste0("<br>", words[idx])
+  paste(words, collapse = " ")
+}
+
+l1ad <- st_read(
+  "MS242_L1.gdb",
+  layer = "SALURBAL_L1AD_NoSmallIslands_PublicIDs20230922",
+  quiet = TRUE
+)
+SALID1_PUBSALID1 <- read_csv("SALID1_PUBSALID1.csv")
+
+l1ad <- l1ad %>%
+  left_join(
+    SALID1_PUBSALID1,
+    by = "PUBSALID1"
+  )
+
+l1_lookup <- l1ad %>%
+  st_drop_geometry() %>%
+  filter(!is.na(SALID1), !is.na(L1NAME)) %>%
+  distinct(SALID1, L1NAME) %>%
+  group_by(SALID1) %>%
+  summarise(L1NAME = first(L1NAME), .groups = "drop")
+
+
+TOP_SALID1 <- 15
+
+salid1_rank <- dgw_salid1_year %>%
+  group_by(ISO2, SALID1) %>%
+  summarise(total = sum(cases, na.rm = TRUE), .groups = "drop") %>%
+  left_join(l1_lookup, by = "SALID1") %>%
+  mutate(
+    L1LABEL = coalesce(L1NAME, as.character(SALID1)),
+    L1LABEL_WRAPPED = vapply(L1LABEL, wrap_words_br, character(1), n = 3)
+  ) %>%
+  arrange(ISO2, desc(total)) %>%
+  group_by(ISO2) %>%
+  slice_head(n = TOP_SALID1) %>%
+  ungroup()
+
+isos <- sort(unique(salid1_rank$ISO2))
+
+fig <- plot_ly()
+
+y_linear_list <- list()
+y_sqrt_list   <- list()
+
+for (iso in isos) {
+
+  salids_df <- salid1_rank %>%
+    filter(ISO2 == iso) %>%
+    select(SALID1, L1LABEL, L1LABEL_WRAPPED)
+  if (nrow(salids_df) < TOP_SALID1) {
+    salids_df <- bind_rows(
+      salids_df,
+      tibble(
+        SALID1 = rep(NA_integer_, TOP_SALID1 - nrow(salids_df)),
+        L1LABEL = rep(NA_character_, TOP_SALID1 - nrow(salids_df)),
+        L1LABEL_WRAPPED = rep(NA_character_, TOP_SALID1 - nrow(salids_df))
+      )
+    )
+  }
+
+  for (k in seq_len(TOP_SALID1)) {
+
+    s1   <- salids_df$SALID1[k]
+    lab  <- salids_df$L1LABEL[k]
+    labw <- salids_df$L1LABEL_WRAPPED[k]
+
+    df <- dgw_salid1_year %>%
+      filter(ISO2 == iso, SALID1 == s1) %>%
+      arrange(year)
+
+    if (is.na(s1) || nrow(df) == 0) {
+      fig <- fig %>% add_trace(
+        x = numeric(0),
+        y = numeric(0),
+        customdata = numeric(0),
+        type = "scatter",
+        mode = "lines",
+        name = "NA",
+        visible = FALSE,
+        hoverinfo = "skip"
+      )
+
+      y_linear_list[[length(y_linear_list) + 1]] <- numeric(0)
+      y_sqrt_list[[length(y_sqrt_list) + 1]]     <- numeric(0)
+
+    } else {
+      df <- df %>%
+        mutate(
+          cases_clean = if_else(is.na(cases), 0, cases),
+          cases_sqrt  = sqrt(pmax(cases_clean, 0))
+        )
+
+      fig <- fig %>% add_trace(
+        data = df,
+        x = ~year,
+        y = ~cases_clean,                 
+        customdata = ~cases_clean,        
+        type = "scatter",
+        mode = "lines",
+        name = as.character(labw),        
+        visible = FALSE,
+        hovertemplate = paste0(
+          "ISO2: ", iso,
+          "<br>L1NAME: ", labw,
+          "<br>SALID1: ", s1,
+          "<br>Year: %{x}",
+          "<br>Cases: %{customdata:,}",
+          "<extra></extra>"
+        )
+      )
+
+      y_linear_list[[length(y_linear_list) + 1]] <- df$cases_clean
+      y_sqrt_list[[length(y_sqrt_list) + 1]]     <- df$cases_sqrt
+    }
+  }
+}
+
+
+default_iso <- isos[1]
+default_block <- which(isos == default_iso)
+
+vis0 <- rep(FALSE, length(isos) * TOP_SALID1)
+start0 <- (default_block - 1) * TOP_SALID1 + 1
+end0   <- start0 + TOP_SALID1 - 1
+vis0[start0:end0] <- TRUE
+
+fig <- fig %>% style(visible = vis0)
+
+
+country_buttons <- lapply(seq_along(isos), function(i) {
+
+  vis <- rep(FALSE, length(isos) * TOP_SALID1)
+  s <- (i - 1) * TOP_SALID1 + 1
+  e <- s + TOP_SALID1 - 1
+  vis[s:e] <- TRUE
+
+  list(
+    method = "update",
+    args = list(
+      list(visible = vis),
+      list(title = NULL)
+    ),
+    label = isos[i]
+  )
+})
+
+
+scale_buttons <- list(
+  list(
+    method = "update",
+    args = list(
+      list(y = y_linear_list),
+      list(yaxis = list(title = "Cases"), annotations = NULL)
+    ),
+    label = "Linear"
+  ),
+  list(
+    method = "update",
+    args = list(
+      list(y = y_sqrt_list),
+      list(yaxis = list(title = "Sqrt(Cases)"), annotations = NULL)
+    ),
+    label = "Sqrt scale"
+  )
+)
+
+fig %>%
+  layout(
+    title = NULL,
+    xaxis = list(title = "Year"),
+    yaxis = list(title = "Cases"),
+    updatemenus = list(
+      list(type = "dropdown", buttons = country_buttons, x = 0, y = 1.15),
+      list(type = "buttons", direction = "right", buttons = scale_buttons, x = 0.55, y = 1.15)
+    ),
+    legend = list(orientation = "v")
+  )
 ```
 
 ### Urban Form and Population Metrics (BEC)
@@ -424,21 +638,34 @@ bec_country_mean <- BEC_long %>%
   filter(full_name %in% vars_keep) %>%
   group_by(ISO2, full_name) %>%
   summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
-  mutate(variable_label = var_labels[full_name]) %>%
+  mutate(variable_label = unname(var_labels[full_name])) %>%
   select(ISO2, variable_label, mean_value)
 
 bec_country_wide <- bec_country_mean %>%
   pivot_wider(names_from = variable_label, values_from = mean_value) %>%
+  arrange(ISO2) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))   
+bec_unique_counts <- BEC_dataset %>%
+  group_by(ISO2) %>%
+  summarise(
+    Cities = n_distinct(SALID1, na.rm = TRUE),
+    Districs = n_distinct(SALID2, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+bec_country_final <- bec_unique_counts %>%
+  left_join(bec_country_wide, by = "ISO2") %>%
   arrange(ISO2)
 
 datatable(
-  bec_country_wide,
+  bec_country_final,
   rownames = FALSE,
   options = list(pageLength = 10, scrollX = TRUE)
 )
+
 ```
 
-## Exploratory visualization of dengue seasonality and environmental variability
+## Exploratory visualization 
 
 ### Heatmaps
 
@@ -448,6 +675,11 @@ Bars represent the mean weekly dengue incidence aggregated across years for a gi
 #| echo: false
 #| warning: false
 #| message: false
+
+library(htmltools)
+library(plotly)
+library(DT)
+library(tidyverse)
 
 library(htmltools)
 library(plotly)
@@ -665,6 +897,7 @@ widgets_by_iso <- lapply(countries, function(iso) {
 })
 names(widgets_by_iso) <- countries
 
+
 ```
 
 ```{r}
@@ -773,287 +1006,175 @@ browsable(tagList(dropdown, panels, js))
 
 ### Maps
 
-![](img/Captura de pantalla 2026-02-03 073554.png)
+![](img/Captura%20de%20pantalla%202026-02-03%20073554.png)
 
-![](img/Captura de pantalla 2026-02-03 073608.png)
+![](img/Captura%20de%20pantalla%202026-02-03%20073608.png)
 
-### Scatter plots
-
-These scatter plots visualize the association between weekly climate metrics and dengue incidence at the **SALID1** level, incorporating short time lags.
-
-**Data structure** - Temporal unit: epidemiological week. - Spatial unit: **SALID1** (L1AD). - Each observation corresponds to one SALID1-week.
-
-**Variables** - **X (climate at week Sx):** - Temperature: `TMPEWMEAN_L1` (weekly mean temperature, °C) - Precipitation: `PRCEWMEAN_L1` (weekly mean precipitation, mm) - **Y (dengue outcome):** - `incidence_100k` (weekly dengue incidence per 100,000)
-
-**Lag definition (lead-based)** For each SALID1 time series ordered by `(DGWSYMEPIYR, DGWSYMEPIWK)`, lagged outcomes are built by shifting incidence forward: - Lag0: Climate(Sx) vs Incidence(Sx) - Lag1: Climate(Sx) vs Incidence(Sx+1) - Lag2: Climate(Sx) vs Incidence(Sx+2)
 
 ```{r}
-#| echo: true
+#| echo: false
 #| warning: false
 #| message: false
 
-library(tidyverse)
-library(readr)
-library(purrr)
-library(stringr)
-
-# 0) Periodos
-period_def <- function(year) {
-  dplyr::case_when(
-    year >= 2000 & year <= 2005 ~ "2000-2005",
-    year >= 2006 & year <= 2011 ~ "2006-2011",
-    year >= 2012 & year <= 2017 ~ "2012-2017",
-    year >= 2018 & year <= 2024 ~ "2018-2024",
-    TRUE ~ NA_character_
-  )
+to_week_start <- function(year, week) {
+  x <- sprintf("%d-W%02d-1", as.integer(year), as.integer(week))
+  suppressWarnings(as.Date(ISOweek2date(x)))
 }
 
-# 1) Cargar datasets desde landing_data (asegúrate que landing_data ya existe)
-#    Si landing_data no existe aún en tu doc, tienes que ejecutar antes tu bloque que lo crea.
-stopifnot(exists("landing_data"))
-
-# Requiere DGW_L1AD, PRCEWL2, TMPEWL2 en landing_data
-stopifnot("DGW_L1AD" %in% names(landing_data))
-stopifnot("PRCEWL2" %in% names(landing_data))
-stopifnot("TMPEWL2" %in% names(landing_data))
-
-DGWL1AD <- landing_data[["DGW_L1AD"]]
-
-# 2) Cargar PRJ (población L1AD) desde "other data files"
-path_other <- file.path("data", "other data files")
-
-files_prj <- list.files(
-  path = path_other,
-  pattern = "^PRJ.*\\.csv$",
-  full.names = TRUE
-)
-
-stopifnot(length(files_prj) > 0)
-
-PRJ_L1AD_all <- files_prj %>%
-  set_names() %>%
-  map_dfr(~ read_csv(.x, show_col_types = FALSE), .id = "source_file")
-
-# Ajusta nombres si tu PRJ no usa exactamente estas columnas
-stopifnot(all(c("ISO2","SALID1","YEAR","PRJL1ADPOP") %in% names(PRJ_L1AD_all)))
-
-PRJ_L1AD_year <- PRJ_L1AD_all %>%
-  group_by(ISO2, SALID1, YEAR) %>%
-  summarise(PRJL1ADPOP_sum = sum(PRJL1ADPOP, na.rm = TRUE), .groups = "drop") %>%
-  rename(DGWSYMEPIYR = YEAR)
-
-# 3) Dengue semanal a SALID1 (sum casos) + incidencia 100k
-stopifnot(all(c("ISO2","SALID1","DGWSYMEPIYR","DGWSYMEPIWK","DGWCONFIRML1AD") %in% names(DGWL1AD)))
-
-DGWL1AD_sum <- DGWL1AD %>%
-  group_by(ISO2, SALID1, DGWSYMEPIYR, DGWSYMEPIWK) %>%
-  summarise(DGWCONFIRML1AD = sum(DGWCONFIRML1AD, na.rm = TRUE), .groups = "drop")
-
-DGWL1AD_sum_pop <- DGWL1AD_sum %>%
-  left_join(
-    PRJ_L1AD_year %>% select(ISO2, SALID1, DGWSYMEPIYR, PRJL1ADPOP_sum),
-    by = c("ISO2", "SALID1", "DGWSYMEPIYR")
-  )
-
-DGWL1AD_incidence <- DGWL1AD_sum_pop %>%
-  mutate(
-    incidence_100k = dplyr::if_else(
-      is.na(PRJL1ADPOP_sum) | PRJL1ADPOP_sum == 0,
-      NA_real_,
-      (DGWCONFIRML1AD / PRJL1ADPOP_sum) * 1e5
-    )
-  )
-
-# 4) Clima semanal por SALID1
-# Nota: estás promediando desde L2 a SALID1, usando SALID1 en TMP/PRC.
-# Verifica que TMP/PRC realmente tengan SALID1.
-stopifnot(all(c("ISO2","SALID1","EPIYEAR","EPIWEEK") %in% names(TMP)))
-stopifnot(all(c("ISO2","SALID1","EPIYEAR","EPIWEEK") %in% names(PRC)))
-
-TMP_L1_year_w <- TMP %>%
-  group_by(ISO2, SALID1, EPIYEAR, EPIWEEK) %>%
-  summarise(TMPEWMEAN_L1 = mean(TMPEWMEAN_L2, na.rm = TRUE), .groups = "drop")
-
-PRC_L1_year_w <- PRC %>%
-  group_by(ISO2, SALID1, EPIYEAR, EPIWEEK) %>%
-  summarise(PRCEWMEAN_L1 = mean(PRCEWMEANL2, na.rm = TRUE), .groups = "drop")
-
-# 5) Join final
-DGWL1AD_inc_clim <- DGWL1AD_incidence %>%
-  left_join(
-    TMP_L1_year_w %>% select(ISO2, SALID1, EPIYEAR, EPIWEEK, TMPEWMEAN_L1),
-    by = c("ISO2", "SALID1", "DGWSYMEPIYR" = "EPIYEAR", "DGWSYMEPIWK" = "EPIWEEK")
-  ) %>%
-  left_join(
-    PRC_L1_year_w %>% select(ISO2, SALID1, EPIYEAR, EPIWEEK, PRCEWMEAN_L1),
-    by = c("ISO2", "SALID1", "DGWSYMEPIYR" = "EPIYEAR", "DGWSYMEPIWK" = "EPIWEEK")
-  ) %>%
-  mutate(period = period_def(as.integer(DGWSYMEPIYR))) %>%
-  filter(!is.na(period))
-
-```
-
-```{r}
-#| echo: true
-#| warning: false
-#| message: false
-
-library(dplyr)
-library(ggplot2)
-library(stringr)
-
-# ----------------------------
-# Settings
-# ----------------------------
 max_lag <- 5
+lag_vals <- 0:max_lag
+n_bins <- 35
 
-# Optional: downsample to keep render light when plotting ALL SALID1 together
-# Set to NULL to disable sampling.
-max_points_per_plot <- 60000
 
-# ----------------------------
-# Helper: build lagged dataset for a given country and metric
-# Lag definition (as you asked):
-# lag0: X(Sx) vs Inc(Sx)
-# lag1: X(Sx) vs Inc(Sx+1)
-# lag2: X(Sx) vs Inc(Sx+2)
-# ...
-# ----------------------------
-make_scatter_data_lags <- function(dat, iso, metric = c("TMP", "PRC"), max_lag = 5) {
-  metric <- match.arg(metric)
+DGW_s1 <- DGW %>%
+  transmute(
+    ISO2,
+    SALID1 = as.integer(SALID1),
+    year   = as.integer(DGWSYMEPIYR),
+    week   = as.integer(DGWSYMEPIWK),
+    cases  = as.numeric(.data[[CONF_COL]])
+  ) %>%
+  filter(!is.na(ISO2), !is.na(SALID1), week >= 1, week <= 53) %>%
+  group_by(ISO2, SALID1, year, week) %>%
+  summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop") %>%
+  mutate(week_start = to_week_start(year, week)) %>%
+  filter(!is.na(week_start))
 
-  dfi <- dat %>%
+# -----------------------------
+# Weekly temperature by SALID1
+# -----------------------------
+TMP_s1 <- TMP %>%
+  transmute(
+    ISO2,
+    SALID1 = as.integer(SALID1),
+    year   = as.integer(EPIYEAR),
+    week   = as.integer(EPIWEEK),
+    temp   = as.numeric(TMPEWMEAN_L2)
+  ) %>%
+  filter(!is.na(ISO2), !is.na(SALID1), week >= 1, week <= 53) %>%
+  group_by(ISO2, SALID1, year, week) %>%
+  summarise(temp = mean(temp, na.rm = TRUE), .groups = "drop") %>%
+  mutate(week_start = to_week_start(year, week)) %>%
+  filter(!is.na(week_start))
+
+
+prc_candidates <- names(PRC)[
+  str_detect(names(PRC), regex("PRC", ignore_case = TRUE)) &
+    str_detect(names(PRC), regex("MEAN|EWMEAN|AVG", ignore_case = TRUE))
+]
+
+if (length(prc_candidates) == 0) {
+  stop("No precipitation mean column found in PRC. Run names(PRC) to inspect available columns.")
+}
+
+PRC_COL <- prc_candidates[1]
+message("Using precipitation column: ", PRC_COL)
+
+PRC_s1 <- PRC %>%
+  transmute(
+    ISO2,
+    SALID1 = as.integer(SALID1),
+    year   = as.integer(EPIYEAR),
+    week   = as.integer(EPIWEEK),
+    prc    = as.numeric(.data[[PRC_COL]])
+  ) %>%
+  filter(!is.na(ISO2), !is.na(SALID1), week >= 1, week <= 53) %>%
+  group_by(ISO2, SALID1, year, week) %>%
+  summarise(prc = mean(prc, na.rm = TRUE), .groups = "drop") %>%
+  mutate(week_start = to_week_start(year, week)) %>%
+  filter(!is.na(week_start))
+
+CLIM_ALL <- TMP_s1 %>%
+  left_join(PRC_s1, by = c("ISO2","SALID1","year","week","week_start")) %>%
+  left_join(DGW_s1, by = c("ISO2","SALID1","year","week","week_start")) %>%
+  mutate(cases = coalesce(cases, 0))
+
+countries <- sort(unique(DGW_s1$ISO2))
+
+
+build_heat_mean_annual_sum <- function(df, iso, varname, lag_vals, n_bins) {
+
+  base <- df %>%
     filter(ISO2 == iso) %>%
-    transmute(
-      ISO2,
-      SALID1,
-      year   = as.integer(DGWSYMEPIYR),
-      week   = as.integer(DGWSYMEPIWK),
-      period = period,
-      inc    = as.numeric(incidence_100k),
-      x_tmp  = as.numeric(TMPEWMEAN_L1),
-      x_prc  = as.numeric(PRCEWMEAN_L1)
-    ) %>%
-    filter(!is.na(period)) %>%
-    arrange(SALID1, year, week) %>%
+    select(SALID1, year, week_start, cases, !!sym(varname)) %>%
+    rename(clim = !!sym(varname)) %>%
+    arrange(SALID1, week_start) %>%
     group_by(SALID1)
 
-  for (k in 0:max_lag) {
-    dfi <- dfi %>% mutate(!!paste0("inc_lag", k) := dplyr::lead(inc, k))
+  for (k in lag_vals) {
+    base <- base %>% mutate(!!paste0("cases_lag", k) := lead(cases, k))
   }
+  base <- base %>% ungroup()
 
-  dfi <- dfi %>% ungroup()
+  df_long <- base %>%
+    pivot_longer(
+      cols = starts_with("cases_lag"),
+      names_to = "lag",
+      values_to = "cases_lag"
+    ) %>%
+    mutate(lag = as.integer(gsub("cases_lag", "", lag))) %>%
+    filter(!is.na(clim), !is.na(cases_lag))
 
-  xvar <- if (metric == "TMP") "x_tmp" else "x_prc"
-  dfi %>% mutate(x = .data[[xvar]])
-}
+  clim_range <- range(df_long$clim, na.rm = TRUE)
+  breaks <- seq(clim_range[1], clim_range[2], length.out = n_bins + 1)
 
-# ----------------------------
-# Helper: one scatter plot for a specific lag
-# ----------------------------
-plot_scatter_lag <- function(df, lag_k = 0, metric = c("TMP", "PRC"),
-                             max_points = NULL, iso = NULL) {
-  metric <- match.arg(metric)
-
-  ycol <- paste0("inc_lag", lag_k)
-
-  xlab <- if (metric == "TMP") {
-    "Weekly mean temperature (°C)"
-  } else {
-    "Weekly mean precipitation (mm)"
-  }
-
-  ylab <- paste0("Weekly dengue incidence per 100,000 (Sx+", lag_k, ")")
-
-  # Título como quieres: ISO2 - Temperature - Lag0
-  metric_name <- if (metric == "TMP") "Temperature" else "Precipitation"
-  title_plot <- paste0(iso, " - ", metric_name, " - Lag", lag_k)
-
-  dfp <- df %>%
-    filter(!is.na(x), !is.na(.data[[ycol]]))
-
-  if (!is.null(max_points) && nrow(dfp) > max_points) {
-    set.seed(1)
-    dfp <- dfp %>% slice_sample(n = max_points)
-  }
-
-  ggplot(dfp, aes(x = x, y = .data[[ycol]], color = period)) +
-    geom_point(alpha = 0.5, size = 0.9) +
-    labs(
-      title = title_plot,
-      x = xlab,
-      y = ylab,
-      color = "Period"
-    ) +
-    theme_bw(base_size = 11) +
-    theme(
-      panel.grid.minor = element_blank(),
-      axis.title = element_text(face = "bold"),
-      legend.title = element_text(face = "bold"),
-      plot.title = element_text(face = "bold")
+  df_binned <- df_long %>%
+    mutate(
+      clim_bin = findInterval(clim, vec = breaks, all.inside = TRUE),
+      clim_mid = (breaks[clim_bin] + breaks[clim_bin + 1]) / 2
     )
+
+  annual_sum <- df_binned %>%
+    group_by(year, lag, clim_mid) %>%
+    summarise(annual_cases = sum(cases_lag, na.rm = TRUE), .groups = "drop")
+
+  df_heat <- annual_sum %>%
+    group_by(lag, clim_mid) %>%
+    summarise(intensity = mean(annual_cases, na.rm = TRUE), .groups = "drop")
+
+  grid <- tidyr::expand_grid(
+    lag = lag_vals,
+    clim_mid = sort(unique(df_heat$clim_mid))
+  )
+
+  grid %>%
+    left_join(df_heat, by = c("lag","clim_mid")) %>%
+    mutate(intensity = coalesce(intensity, 0))
 }
 
-# ----------------------------
-# Safety checks (fail early with clear messages)
-# ----------------------------
-req_cols <- c(
-  "ISO2", "SALID1", "DGWSYMEPIYR", "DGWSYMEPIWK",
-  "period", "incidence_100k", "TMPEWMEAN_L1", "PRCEWMEAN_L1"
+legend_lab <- scales::label_number(
+  accuracy = 1,
+  big.mark = ",",
+  scale_cut = scales::cut_short_scale()
 )
-missing_cols <- setdiff(req_cols, names(DGWL1AD_inc_clim))
-if (length(missing_cols) > 0) {
-  stop("DGWL1AD_inc_clim is missing required columns: ", paste(missing_cols, collapse = ", "))
-}
 
-countries_scatter <- sort(unique(DGWL1AD_inc_clim$ISO2))
-if (length(countries_scatter) == 0) stop("No ISO2 found in DGWL1AD_inc_clim.")
-
-# ----------------------------
-# Render: for each country
-# Temperature lag0..lag5
-# Precipitation lag0..lag5
-# ----------------------------
-for (iso in countries_scatter) {
+for (iso in countries) {
 
   cat("\n\n")
-  cat("## Scatter plots - ", iso, "\n\n", sep = "")
 
-  df_tmp <- make_scatter_data_lags(
-    DGWL1AD_inc_clim,
-    iso = iso,
-    metric = "TMP",
-    max_lag = max_lag
-  )
+ df_temp <- build_heat_mean_annual_sum(CLIM_ALL, iso, "temp", lag_vals, n_bins)
 
-  for (k in 0:max_lag) {
-    print(plot_scatter_lag(
-      df_tmp,
-      lag_k = k,
-      metric = "TMP",
-      max_points = max_points_per_plot,
-      iso = iso
-    ))
-    cat("\n\n")
-  }
 
-  df_prc <- make_scatter_data_lags(
-    DGWL1AD_inc_clim,
-    iso = iso,
-    metric = "PRC",
-    max_lag = max_lag
-  )
+  p_temp <- ggplot(df_temp, aes(x = lag, y = clim_mid, fill = intensity)) +
+    geom_tile() +
+    scale_x_continuous(breaks = lag_vals) +
+    scale_fill_gradient(
+      low = "#fee5d9", high = "#a50f15",
+      labels = legend_lab
+    ) +
+    labs(
+      title = paste0(iso, " | Temperature(t) vs Lag, TOTAL cases at t+lag"),
+      x = "Lag (weeks)",
+      y = "Temperature (°C, bin midpoint)",
+      fill = "Total dengue cases\n(t+lag)"
+    ) +
+    theme_bw() +
+    theme(panel.grid = element_blank())
 
-  for (k in 0:max_lag) {
-    print(plot_scatter_lag(
-      df_prc,
-      lag_k = k,
-      metric = "PRC",
-      max_points = max_points_per_plot,
-      iso = iso
-    ))
-    cat("\n\n")
-  }
+  print(p_temp)
+
+  
 }
-
 ```
+
+
